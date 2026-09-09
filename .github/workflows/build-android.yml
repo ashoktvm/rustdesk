@@ -13,49 +13,80 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Tools
+      - name: Install Android Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y zipalign apksigner apktool wget jq
+          sudo apt-get install -y zipalign apksigner apktool wget jq zip unzip
 
-      - name: Download Latest Official RustDesk Android APK
+      - name: Download Official RustDesk Release APK
         run: |
-          APK_URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest | jq -r '.assets[] | select(.name | endswith("-arm64-v8a.apk")) | .browser_download_url' | head -n 1)
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest)
+          APK_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("arm64-v8a.apk$")) | .browser_download_url' | head -n 1)
           if [ -z "$APK_URL" ] || [ "$APK_URL" = "null" ]; then
-            APK_URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+            APK_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test(".apk$")) | .browser_download_url' | head -n 1)
           fi
           echo "Downloading $APK_URL"
           wget -q -O rustdesk-official.apk "$APK_URL"
 
-      - name: Decompile APK
+      - name: Inject Pre-Configuration via Direct Zip Patching
         run: |
-          apktool d -f -r rustdesk-official.apk -o apk_unpacked
+          # Create working folder
+          mkdir -p patch_files/assets/flutter_assets/assets
+          mkdir -p patch_files/assets/flutter_assets/cfg
+          mkdir -p patch_files/assets
 
-      - name: Inject Custom Server Config into Flutter Assets
-        run: |
-          # RustDesk reads configuration from assets/flutter_assets/assets/config.toml
-          TARGET_DIR="apk_unpacked/assets/flutter_assets/assets"
-          mkdir -p "$TARGET_DIR"
-
-          cat << 'EOF' > "$TARGET_DIR/config.toml"
-          custom-rendezvous-server = "${{ secrets.RENDEZVOUS_SERVER }}"
-          relay-server = "${{ secrets.RELAY_SERVER }}"
-          api-server = "${{ secrets.API_SERVER }}"
-          key = "${{ secrets.PUB_KEY }}"
+          # 1. Config format A (TOML with options table)
+          cat << 'EOF' > patch_files/assets/flutter_assets/assets/config.toml
+          [options]
+          custom-rendezvous-server = '${{ secrets.RENDEZVOUS_SERVER }}'
+          relay-server = '${{ secrets.RELAY_SERVER }}'
+          api-server = '${{ secrets.API_SERVER }}'
+          key = '${{ secrets.PUB_KEY }}'
           EOF
 
-          echo "Injected config.toml:"
-          cat "$TARGET_DIR/config.toml"
+          # 2. Config format B (TOML flat)
+          cat << 'EOF' > patch_files/assets/flutter_assets/assets/RustDesk2.toml
+          custom-rendezvous-server = '${{ secrets.RENDEZVOUS_SERVER }}'
+          relay-server = '${{ secrets.RELAY_SERVER }}'
+          api-server = '${{ secrets.API_SERVER }}'
+          key = '${{ secrets.PUB_KEY }}'
+          EOF
 
-      - name: Rebuild APK
-        run: |
-          apktool b apk_unpacked -o rustdesk-unsigned.apk
+          # 3. Config format C (JSON config)
+          cat << 'EOF' > patch_files/assets/flutter_assets/assets/config.json
+          {
+            "custom-rendezvous-server": "${{ secrets.RENDEZVOUS_SERVER }}",
+            "relay-server": "${{ secrets.RELAY_SERVER }}",
+            "api-server": "${{ secrets.API_SERVER }}",
+            "key": "${{ secrets.PUB_KEY }}"
+          }
+          EOF
 
-      - name: Align and Sign APK
+          # Duplicate into flutter_assets/cfg and root assets
+          cp patch_files/assets/flutter_assets/assets/config.toml patch_files/assets/config.toml
+          cp patch_files/assets/flutter_assets/assets/config.json patch_files/assets/config.json
+          cp patch_files/assets/flutter_assets/assets/config.json patch_files/assets/flutter_assets/cfg/default.json
+
+          # Inject directly into APK without breaking binary structures
+          cd patch_files
+          zip -u ../rustdesk-official.apk assets/flutter_assets/assets/config.toml
+          zip -u ../rustdesk-official.apk assets/flutter_assets/assets/RustDesk2.toml
+          zip -u ../rustdesk-official.apk assets/flutter_assets/assets/config.json
+          zip -u ../rustdesk-official.apk assets/flutter_assets/cfg/default.json
+          zip -u ../rustdesk-official.apk assets/config.toml
+          zip -u ../rustdesk-official.apk assets/config.json
+          cd ..
+
+      - name: Strip Old Signatures and Re-align
         run: |
-          zipalign -v -p 4 rustdesk-unsigned.apk rustdesk-aligned.apk
+          # Strip original signature metadata to prevent signature verification failure
+          zip -d rustdesk-official.apk 'META-INF/*' || true
           
-          # Generate standard release keystore
+          # Zipalign the modified APK
+          zipalign -v -p 4 rustdesk-official.apk rustdesk-aligned.apk
+
+      - name: Sign APK with Release Certificate
+        run: |
           keytool -genkeypair -v \
             -keystore release.keystore \
             -storepass ashokdesk123 \
@@ -64,9 +95,8 @@ jobs:
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -dname "CN=Ashok Remote, OU=IT, O=AshokTVM, L=Trivandrum, ST=Kerala, C=IN"
-          
-          # Sign using apksigner with V1, V2, and V3 signing schemes enabled
+            -dname "CN=RustDesk Client, OU=Remote, O=AshokTVM, L=Trivandrum, ST=Kerala, C=IN"
+
           apksigner sign \
             --ks release.keystore \
             --ks-pass pass:ashokdesk123 \
@@ -75,11 +105,11 @@ jobs:
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
-            --out rustdesk-custom.apk \
+            --out rustdesk-ashoktvm.apk \
             rustdesk-aligned.apk
 
-      - name: Upload Configured APK
+      - name: Upload Finished APK
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-custom-arm64
-          path: rustdesk-custom.apk
+          name: rustdesk-ashoktvm-arm64
+          path: rustdesk-ashoktvm.apk
