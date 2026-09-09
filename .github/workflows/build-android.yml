@@ -6,8 +6,6 @@ on:
 jobs:
   build-android:
     runs-on: ubuntu-latest
-    container:
-      image: rustdesk/rustdesk-builder:latest
 
     steps:
       - name: Checkout Source Code
@@ -15,21 +13,55 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Set up Rust & Android Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Build Dependencies & cargo-ndk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build
+          cargo install cargo-ndk
+
+      - name: Configure Android NDK Environment
+        run: |
+          # Detect pre-installed Android NDK on the runner and export it to the environment
+          NDK_PATH=$(find $ANDROID_SDK_ROOT/ndk -maxdepth 1 -mindepth 1 | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+          echo "Found NDK at: $NDK_PATH"
+
       - name: Inject Custom Server Configuration into Source
         run: |
-          # Patch default rendezvous servers
-          sed -i 's/pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[/pub const RENDEZVOUS_SERVERS: \&\[\&str\] = \&\["${{ secrets.RENDEZVOUS_SERVER }}", /g' libs/hbb_common/src/config.rs
-          
-          # Patch public key
-          sed -i 's/pub const RS_PUB_KEY: &str = "";/pub const RS_PUB_KEY: \&str = "${{ secrets.PUB_KEY }}";/g' libs/hbb_common/src/config.rs
+          SERVER="${{ secrets.RENDEZVOUS_SERVER }}"
+          SERVER=${SERVER:-rust.ashoktvm.in}
+          KEY="${{ secrets.PUB_KEY }}"
+          KEY=${KEY:-Wqbs5PA38BE0TbfTpVo7ElRVT7ytcnyglvUAH+RmYIE=}
 
-          echo "Verifying patch in config.rs:"
+          # Bake the rendezvous server into Rust core
+          sed -i "s/pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[/pub const RENDEZVOUS_SERVERS: \&\[\&str\] = \&\[\"$SERVER\", /g" libs/hbb_common/src/config.rs
+
+          # Bake the public key into Rust core
+          sed -i "s/pub const RS_PUB_KEY: &str = \"\";/pub const RS_PUB_KEY: \&str = \"$KEY\";/g" libs/hbb_common/src/config.rs
+
+          echo "Verifying patched lines in config.rs:"
           grep -n "RENDEZVOUS_SERVERS" libs/hbb_common/src/config.rs || true
           grep -n "RS_PUB_KEY" libs/hbb_common/src/config.rs || true
 
       - name: Build Android ARM64 Release APK
         run: |
-          # Build Flutter & native librustdesk.so inside official container
           cd flutter
           flutter pub get
           flutter build apk --release --target-platform android-arm64 --split-per-abi
