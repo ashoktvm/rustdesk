@@ -1,115 +1,41 @@
-name: Build Pre-Configured Android APK
+name: Build Custom RustDesk Android APK
 
 on:
   workflow_dispatch:
 
 jobs:
-  patch-apk:
+  build-android:
     runs-on: ubuntu-latest
+    container:
+      image: rustdesk/rustdesk-builder:latest
+
     steps:
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          fetch-depth: 1
 
-      - name: Install Android Tools
+      - name: Inject Custom Server Configuration into Source
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zipalign apksigner apktool wget jq zip unzip
-
-      - name: Download Official RustDesk Release APK
-        run: |
-          RELEASE_JSON=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest)
-          APK_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("arm64-v8a.apk$")) | .browser_download_url' | head -n 1)
-          if [ -z "$APK_URL" ] || [ "$APK_URL" = "null" ]; then
-            APK_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test(".apk$")) | .browser_download_url' | head -n 1)
-          fi
-          echo "Downloading $APK_URL"
-          wget -q -O rustdesk-official.apk "$APK_URL"
-
-      - name: Inject Pre-Configuration via Direct Zip Patching
-        run: |
-          # Create working folder
-          mkdir -p patch_files/assets/flutter_assets/assets
-          mkdir -p patch_files/assets/flutter_assets/cfg
-          mkdir -p patch_files/assets
-
-          # 1. Config format A (TOML with options table)
-          cat << 'EOF' > patch_files/assets/flutter_assets/assets/config.toml
-          [options]
-          custom-rendezvous-server = '${{ secrets.RENDEZVOUS_SERVER }}'
-          relay-server = '${{ secrets.RELAY_SERVER }}'
-          api-server = '${{ secrets.API_SERVER }}'
-          key = '${{ secrets.PUB_KEY }}'
-          EOF
-
-          # 2. Config format B (TOML flat)
-          cat << 'EOF' > patch_files/assets/flutter_assets/assets/RustDesk2.toml
-          custom-rendezvous-server = '${{ secrets.RENDEZVOUS_SERVER }}'
-          relay-server = '${{ secrets.RELAY_SERVER }}'
-          api-server = '${{ secrets.API_SERVER }}'
-          key = '${{ secrets.PUB_KEY }}'
-          EOF
-
-          # 3. Config format C (JSON config)
-          cat << 'EOF' > patch_files/assets/flutter_assets/assets/config.json
-          {
-            "custom-rendezvous-server": "${{ secrets.RENDEZVOUS_SERVER }}",
-            "relay-server": "${{ secrets.RELAY_SERVER }}",
-            "api-server": "${{ secrets.API_SERVER }}",
-            "key": "${{ secrets.PUB_KEY }}"
-          }
-          EOF
-
-          # Duplicate into flutter_assets/cfg and root assets
-          cp patch_files/assets/flutter_assets/assets/config.toml patch_files/assets/config.toml
-          cp patch_files/assets/flutter_assets/assets/config.json patch_files/assets/config.json
-          cp patch_files/assets/flutter_assets/assets/config.json patch_files/assets/flutter_assets/cfg/default.json
-
-          # Inject directly into APK without breaking binary structures
-          cd patch_files
-          zip -u ../rustdesk-official.apk assets/flutter_assets/assets/config.toml
-          zip -u ../rustdesk-official.apk assets/flutter_assets/assets/RustDesk2.toml
-          zip -u ../rustdesk-official.apk assets/flutter_assets/assets/config.json
-          zip -u ../rustdesk-official.apk assets/flutter_assets/cfg/default.json
-          zip -u ../rustdesk-official.apk assets/config.toml
-          zip -u ../rustdesk-official.apk assets/config.json
-          cd ..
-
-      - name: Strip Old Signatures and Re-align
-        run: |
-          # Strip original signature metadata to prevent signature verification failure
-          zip -d rustdesk-official.apk 'META-INF/*' || true
+          # Patch default rendezvous servers
+          sed -i 's/pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[/pub const RENDEZVOUS_SERVERS: \&\[\&str\] = \&\["${{ secrets.RENDEZVOUS_SERVER }}", /g' libs/hbb_common/src/config.rs
           
-          # Zipalign the modified APK
-          zipalign -v -p 4 rustdesk-official.apk rustdesk-aligned.apk
+          # Patch public key
+          sed -i 's/pub const RS_PUB_KEY: &str = "";/pub const RS_PUB_KEY: \&str = "${{ secrets.PUB_KEY }}";/g' libs/hbb_common/src/config.rs
 
-      - name: Sign APK with Release Certificate
+          echo "Verifying patch in config.rs:"
+          grep -n "RENDEZVOUS_SERVERS" libs/hbb_common/src/config.rs || true
+          grep -n "RS_PUB_KEY" libs/hbb_common/src/config.rs || true
+
+      - name: Build Android ARM64 Release APK
         run: |
-          keytool -genkeypair -v \
-            -keystore release.keystore \
-            -storepass ashokdesk123 \
-            -keypass ashokdesk123 \
-            -alias ashokdesk \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=RustDesk Client, OU=Remote, O=AshokTVM, L=Trivandrum, ST=Kerala, C=IN"
+          # Build Flutter & native librustdesk.so inside official container
+          cd flutter
+          flutter pub get
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
 
-          apksigner sign \
-            --ks release.keystore \
-            --ks-pass pass:ashokdesk123 \
-            --ks-key-alias ashokdesk \
-            --key-pass pass:ashokdesk123 \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            --out rustdesk-ashoktvm.apk \
-            rustdesk-aligned.apk
-
-      - name: Upload Finished APK
+      - name: Upload Native Pre-Configured APK
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-ashoktvm-arm64
-          path: rustdesk-ashoktvm.apk
+          name: rustdesk-custom-arm64
+          path: flutter/build/app/outputs/flutter-apk/*arm64-v8a-release.apk
