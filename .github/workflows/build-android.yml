@@ -13,7 +13,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Android Build Tools & Apktool
+      - name: Install Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y zipalign apksigner apktool wget jq
@@ -31,17 +31,21 @@ jobs:
         run: |
           apktool d -f -r rustdesk-official.apk -o apk_unpacked
 
-      - name: Inject Custom Server Config
+      - name: Inject Custom Server Config into Flutter Assets
         run: |
-          mkdir -p apk_unpacked/assets
-          cat <<EOF > apk_unpacked/assets/config.json
-          {
-            "custom-rendezvous-server": "${{ secrets.RENDEZVOUS_SERVER }}",
-            "relay-server": "${{ secrets.RELAY_SERVER }}",
-            "api-server": "${{ secrets.API_SERVER }}",
-            "key": "${{ secrets.PUB_KEY }}"
-          }
+          # RustDesk reads configuration from assets/flutter_assets/assets/config.toml
+          TARGET_DIR="apk_unpacked/assets/flutter_assets/assets"
+          mkdir -p "$TARGET_DIR"
+
+          cat << 'EOF' > "$TARGET_DIR/config.toml"
+          custom-rendezvous-server = "${{ secrets.RENDEZVOUS_SERVER }}"
+          relay-server = "${{ secrets.RELAY_SERVER }}"
+          api-server = "${{ secrets.API_SERVER }}"
+          key = "${{ secrets.PUB_KEY }}"
           EOF
+
+          echo "Injected config.toml:"
+          cat "$TARGET_DIR/config.toml"
 
       - name: Rebuild APK
         run: |
@@ -51,9 +55,28 @@ jobs:
         run: |
           zipalign -v -p 4 rustdesk-unsigned.apk rustdesk-aligned.apk
           
-          keytool -genkeypair -v -keystore release.keystore -storepass password123 -keypass password123 -alias rustdesk -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=RustDesk, OU=Mobile, O=Ashok, L=TVM, ST=KL, C=IN"
+          # Generate standard release keystore
+          keytool -genkeypair -v \
+            -keystore release.keystore \
+            -storepass ashokdesk123 \
+            -keypass ashokdesk123 \
+            -alias ashokdesk \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Ashok Remote, OU=IT, O=AshokTVM, L=Trivandrum, ST=Kerala, C=IN"
           
-          apksigner sign --ks release.keystore --ks-pass pass:password123 --ks-key-alias rustdesk --key-pass pass:password123 --out rustdesk-custom.apk rustdesk-aligned.apk
+          # Sign using apksigner with V1, V2, and V3 signing schemes enabled
+          apksigner sign \
+            --ks release.keystore \
+            --ks-pass pass:ashokdesk123 \
+            --ks-key-alias ashokdesk \
+            --key-pass pass:ashokdesk123 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out rustdesk-custom.apk \
+            rustdesk-aligned.apk
 
       - name: Upload Configured APK
         uses: actions/upload-artifact@v4
