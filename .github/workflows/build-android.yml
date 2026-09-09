@@ -19,7 +19,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
+          flutter-version: '3.24.5'
           cache: true
 
       - name: Set up Rust toolchain
@@ -30,11 +30,15 @@ jobs:
       - name: Install Android NDK & Cargo-NDK
         run: |
           cargo install cargo-ndk
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk-bundle" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
 
-      - name: Inject Custom Server Config
+      - name: Inject Custom Server Config & Gradle Flags
         working-directory: flutter
         run: |
+          # Opt out of incompatible AGP 9 DSL
+          echo "android.newDsl=false" >> android/gradle.properties
+
+          # Inject custom server configurations
           python3 -c "
           pub_key = '${{ secrets.PUB_KEY }}'
           rendezvous = '${{ secrets.RENDEZVOUS_SERVER }}'
@@ -55,10 +59,10 @@ jobs:
         working-directory: flutter
         run: |
           flutter pub get
-          flutter build apk --release --split-per-abi
+          flutter build apk --release --target-platform android-arm64
 
       - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-custom-android-apks
+          name: rustdesk-custom-android-apk
           path: flutter/build/app/outputs/flutter-apk/*.apk
