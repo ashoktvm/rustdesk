@@ -1,68 +1,66 @@
-name: Build Android APK
+name: Build Pre-Configured Android APK
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  patch-apk:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Java 17
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.24.5'
-          cache: true
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-
-      - name: Install Android NDK & Cargo-NDK
+      - name: Install Android Build Tools & Apktool
         run: |
-          cargo install cargo-ndk
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+          sudo apt-get update
+          sudo apt-get install -y zipalign apksigner apktool wget jq
 
-      - name: Inject Custom Server Config & Gradle Flags
-        working-directory: flutter
+      - name: Download Latest Official RustDesk Android APK
         run: |
-          # Opt out of incompatible AGP 9 DSL
-          echo "android.newDsl=false" >> android/gradle.properties
+          # Fetch the latest release APK URL for arm64-v8a
+          APK_URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest | jq -r '.assets[] | select(.name | endswith("-arm64-v8a.apk")) | .browser_download_url' | head -n 1)
+          if [ -z "$APK_URL" ]; then
+            # Fallback if specific ABI tag format differs
+            APK_URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+          fi
+          echo "Downloading $APK_URL"
+          wget -q -O rustdesk-official.apk "$APK_URL"
 
-          # Inject custom server configurations
-          python3 -c "
-          pub_key = '${{ secrets.PUB_KEY }}'
-          rendezvous = '${{ secrets.RENDEZVOUS_SERVER }}'
-          relay = '${{ secrets.RELAY_SERVER }}'
-          api = '${{ secrets.API_SERVER }}'
-
-          config_content = f'''
-          RENDEZVOUS_SERVER={rendezvous}
-          RS_PUB_KEY={pub_key}
-          RELAY_SERVER={relay}
-          API_SERVER={api}
-          '''
-          with open('.env', 'w') as f:
-              f.write(config_content.strip())
-          "
-
-      - name: Build APK
-        working-directory: flutter
+      - name: Decompile APK
         run: |
-          flutter pub get
-          flutter build apk --release --target-platform android-arm64
+          apktool d -f -r rustdesk-official.apk -o apk_unpacked
 
-      - name: Upload APK Artifacts
+      - name: Inject Custom Server Config
+        run: |
+          mkdir -p apk_unpacked/assets
+          cat <<EOF > apk_unpacked/assets/config.json
+          {
+            "custom-rendezvous-server": "${{ secrets.RENDEZVOUS_SERVER }}",
+            "relay-server": "${{ secrets.RELAY_SERVER }}",
+            "api-server": "${{ secrets.API_SERVER }}",
+            "key": "${{ secrets.PUB_KEY }}"
+          }
+          EOF
+
+      - name: Rebuild APK
+        run: |
+          apktool b apk_unpacked -o rustdesk-unsigned.apk
+
+      - name: Align and Sign APK
+        run: |
+          zipalign -v -p 4 rustdesk-unsigned.apk rustdesk-aligned.apk
+          
+          # Generate build keystore
+          keytool -genkeypair -v -keystore release.keystore -storepass password123 -keypass password123 -alias rustdesk -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=RustDesk, OU=Mobile, O=Ashok, L=TVM, ST=KL, C=IN"
+          
+          # Sign using apksigner
+          apksigner sign --ks release.keystore --ks-pass pass:password123 --ks-key-alias rustdesk --key-pass pass:password123 --out rustdesk-custom.apk rustdesk-aligned.apk
+
+      - name: Upload Configured APK
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-custom-android-apk
-          path: flutter/build/app/outputs/flutter-apk/*.apk
+          name: rustdesk-custom-arm64
+          path: rustdesk-custom.apk
