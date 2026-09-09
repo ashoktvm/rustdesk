@@ -20,10 +20,8 @@ jobs:
 
       - name: Download Latest Official RustDesk Android APK
         run: |
-          # Fetch the latest release APK URL for arm64-v8a
           APK_URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest | jq -r '.assets[] | select(.name | endswith("-arm64-v8a.apk")) | .browser_download_url' | head -n 1)
-          if [ -z "$APK_URL" ]; then
-            # Fallback if specific ABI tag format differs
+          if [ -z "$APK_URL" ] || [ "$APK_URL" = "null" ]; then
             APK_URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
           fi
           echo "Downloading $APK_URL"
@@ -53,10 +51,8 @@ jobs:
         run: |
           zipalign -v -p 4 rustdesk-unsigned.apk rustdesk-aligned.apk
           
-          # Generate build keystore
           keytool -genkeypair -v -keystore release.keystore -storepass password123 -keypass password123 -alias rustdesk -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=RustDesk, OU=Mobile, O=Ashok, L=TVM, ST=KL, C=IN"
           
-          # Sign using apksigner
           apksigner sign --ks release.keystore --ks-pass pass:password123 --ks-key-alias rustdesk --key-pass pass:password123 --out rustdesk-custom.apk rustdesk-aligned.apk
 
       - name: Upload Configured APK
